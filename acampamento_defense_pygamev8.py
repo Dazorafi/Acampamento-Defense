@@ -131,14 +131,14 @@ class SoundPlayer:
             return
         sample_rate = 44100
         n_samples = int(sample_rate * duration_ms / 1000)
-        buf = (
-            (math.sin(2 * math.pi * frequency * x / sample_rate) for x in range(n_samples))
-        )
-        # Convert to 16‑bit signed integers
-        arr = bytearray()
-        for s in buf:
-            v = int(s * 32767 * volume)
-            arr += int.to_bytes(v, 2, byteorder='little', signed=True)
+        # Optimize sound generation by pre-calculating constants and using bytearray more efficiently
+        two_pi_freq = 2 * math.pi * frequency / sample_rate
+        scale = 32767 * volume
+        arr = bytearray(n_samples * 2)  # Pre-allocate buffer
+        for x in range(n_samples):
+            v = int(math.sin(two_pi_freq * x) * scale)
+            idx = x * 2
+            arr[idx:idx+2] = v.to_bytes(2, byteorder='little', signed=True)
         sound = pygame.mixer.Sound(buffer=arr)
         sound.play()
 
@@ -190,18 +190,27 @@ class Game:
         self.fullscreen: bool = False
         self.sound_music = True
         self.sound_sfx = True
+        # Collision caching
+        self._player_solids_cache: Optional[List[Dict[str, float]]] = None
+        self._enemy_solids_cache: Optional[List[Dict[str, float]]] = None
+        self._solids_dirty = True
+        # Pre-allocated surfaces for effects (reusable)
+        self._effect_surface = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
         # Player & world
         self.reset_game()
 
     # ------------------------------------------------------------------
     # Utility functions for cabin, ruin and solids
     def cabin_rect(self) -> Dict[str, float]:
-        return {'x': WIDTH / 2 - 80, 'y': HEIGHT / 2 - 70, 'w': 160, 'h': 120}
+        return {'x': self._cabin_center_x - 80, 'y': self._cabin_center_y - 70, 'w': 160, 'h': 120}
 
     def ruin_body(self) -> Dict[str, float]:
         return {'x': self.ruin['x'], 'y': self.ruin['y'], 'w': self.ruin['w'], 'h': self.ruin['h']}
 
     def get_player_solids(self) -> List[Dict[str, float]]:
+        if self._player_solids_cache is not None and not self._solids_dirty:
+            return self._player_solids_cache
+
         solids: List[Dict[str, float]] = []
         c = self.cabin_rect()
         # Four thin rectangles forming a border around the cabin to prevent player overlap
@@ -221,14 +230,27 @@ class Game:
         for s in self.structures:
             if s['type'] == 'wall' and not s['broken']:
                 solids.append({'x': s['x'], 'y': s['y'], 'w': s['w'], 'h': s['h']})
+
+        self._player_solids_cache = solids
         return solids
 
     def get_enemy_solids(self) -> List[Dict[str, float]]:
+        if self._enemy_solids_cache is not None and not self._solids_dirty:
+            return self._enemy_solids_cache
+
         solids = [self.cabin_rect(), self.ruin_body()]
         for s in self.structures:
             if s['type'] == 'wall' and not s['broken']:
                 solids.append({'x': s['x'], 'y': s['y'], 'w': s['w'], 'h': s['h']})
+
+        self._enemy_solids_cache = solids
         return solids
+
+    def invalidate_solids_cache(self) -> None:
+        """Invalidate cached solids when structures change."""
+        self._solids_dirty = True
+        self._player_solids_cache = None
+        self._enemy_solids_cache = None
 
     # ------------------------------------------------------------------
     # Game reset and wave management
@@ -280,6 +302,9 @@ class Game:
         self.camp = {'hp': 150, 'maxHp': 150}
         self.ruin = {'x': WIDTH - 270, 'y': 120, 'w': 150, 'h': 110, 'unlocked': False}
         self.chest = {'x': self.ruin['x'] + 55, 'y': self.ruin['y'] + 40, 'w': 40, 'h': 28, 'opened': False}
+        # Pre-calculate some values used frequently
+        self._cabin_center_x = WIDTH / 2
+        self._cabin_center_y = HEIGHT / 2
         # Trees and rocks randomly placed around the arena edges
         self.trees: List[Dict[str, float]] = []
         self.rocks: List[Dict[str, float]] = []
@@ -311,6 +336,10 @@ class Game:
             self.rocks.append({'x': x, 'y': y, 'w': w, 'h': h})
         # Mark static surface dirty so it will be redrawn
         self.static_dirty = True
+        # Clear collision cache
+        self._player_solids_cache = None
+        self._enemy_solids_cache = None
+        self._solids_dirty = True
         # Stop any music when resetting
         self.sound_player.stop_music()
 
@@ -449,6 +478,7 @@ class Game:
     def structure_break(self, s: Dict) -> None:
         s['broken'] = True
         s['hp'] = 0
+        self.invalidate_solids_cache()
         # After breaking, structures no longer block enemies or damage
 
     # ------------------------------------------------------------------
@@ -507,6 +537,7 @@ class Game:
         if not self.ruin['unlocked'] and door_rect.collidepoint(px, py):
             if self.has_ruin_key:
                 self.ruin['unlocked'] = True
+                self.invalidate_solids_cache()
                 self.message = 'Ruína aberta!'
             else:
                 self.message = 'Precisa da chave para abrir a ruína'
@@ -537,6 +568,7 @@ class Game:
                         self.player['wood'] -= cost
                         s['broken'] = False
                         s['hp'] = s['maxHp']
+                        self.invalidate_solids_cache()
                         self.message = 'Estrutura reparada'
                         if getattr(self, 'sfx_volume', 1.0) > 0:
                             self.sound_player.play_build()
@@ -576,6 +608,9 @@ class Game:
     def update(self, dt: float) -> None:
         if self.state == 'menu':
             return
+        # Mark solids cache as clean at the start of the frame
+        # It will be invalidated only when structures change
+        self._solids_dirty = False
         # Handle pause toggle
         # Pause state logic handled in event loop for clarity
         # Preparation countdown
@@ -593,11 +628,13 @@ class Game:
                 mx /= ln
                 my /= ln
                 # Move player and resolve against obstacles
-                p['x'] += mx * p['speed'] * dt
-                p['y'] += my * p['speed'] * dt
+                move_amount = p['speed'] * dt
+                p['x'] += mx * move_amount
+                p['y'] += my * move_amount
                 # Clamp to screen
-                p['x'] = clamp(p['x'], p['r'], WIDTH - p['r'])
-                p['y'] = clamp(p['y'], p['r'], HEIGHT - p['r'])
+                p_r = p['r']
+                p['x'] = clamp(p['x'], p_r, WIDTH - p_r)
+                p['y'] = clamp(p['y'], p_r, HEIGHT - p_r)
                 # Resolve collisions with solids
                 for rect in self.get_player_solids():
                     resolve_circle_rect(p, rect)
@@ -620,14 +657,14 @@ class Game:
                     self.spawn_enemy(self.spawn_queue.pop(0))
                     self.spawn_timer = 0.55 if self.wave < 8 else 0.35
             # Update bullets
-            for b in self.bullets[:]:
+            bullets_to_keep = []
+            for b in self.bullets:
                 b['x'] += b['vx'] * dt
                 b['y'] += b['vy'] * dt
                 b['life'] -= dt
                 # Remove off screen or expired
                 if (b['life'] <= 0 or b['x'] < -40 or b['x'] > WIDTH + 40 or
                         b['y'] < -40 or b['y'] > HEIGHT + 40):
-                    self.bullets.remove(b)
                     continue
                 # Check collision with enemies
                 hit = False
@@ -637,51 +674,49 @@ class Game:
                         e['hitFlash'] = 0.08
                         if e['hp'] <= 0:
                             self.kill_enemy(e)
-                        if b in self.bullets:
-                            self.bullets.remove(b)
                         hit = True
                         break
                 if hit:
                     continue
                 # Bullets hitting walls
+                wall_hit = False
                 for s in self.structures:
                     if (s['type'] == 'wall' and not s['broken'] and
                             circle_rect_collision(b['x'], b['y'], b['r'], s['x'], s['y'], s['w'], s['h'])):
-                        if b in self.bullets:
-                            self.bullets.remove(b)
+                        wall_hit = True
                         break
+                if not wall_hit:
+                    bullets_to_keep.append(b)
+            self.bullets = bullets_to_keep
+
             # Enemy bullets
-            for b in self.enemy_bullets[:]:
+            enemy_bullets_to_keep = []
+            for b in self.enemy_bullets:
                 b['x'] += b['vx'] * dt
                 b['y'] += b['vy'] * dt
                 b['life'] -= dt
                 if b['life'] <= 0:
-                    self.enemy_bullets.remove(b)
                     continue
                 if math.hypot(b['x'] - p['x'], b['y'] - p['y']) <= b['r'] + p['r']:
                     self.damage_player(b['damage'])
-                    if b in self.enemy_bullets:
-                        self.enemy_bullets.remove(b)
                     continue
                 camp_rect = self.cabin_rect()
                 if circle_rect_collision(b['x'], b['y'], b['r'], camp_rect['x'], camp_rect['y'], camp_rect['w'], camp_rect['h']):
                     self.damage_camp(b['damage'])
-                    if b in self.enemy_bullets:
-                        self.enemy_bullets.remove(b)
                     continue
-                removed = False
+                hit_structure = False
                 for s in self.structures:
                     if (s['type'] == 'wall' and not s['broken'] and
                             circle_rect_collision(b['x'], b['y'], b['r'], s['x'], s['y'], s['w'], s['h'])):
                         self.damage_structure(s, b['damage'])
-                        if b in self.enemy_bullets:
-                            self.enemy_bullets.remove(b)
-                        removed = True
+                        hit_structure = True
                         break
-                if removed:
-                    continue
+                if not hit_structure:
+                    enemy_bullets_to_keep.append(b)
+            self.enemy_bullets = enemy_bullets_to_keep
             # Drops
-            for d in self.drops[:]:
+            drops_to_keep = []
+            for d in self.drops:
                 if math.hypot(d['x'] - p['x'], d['y'] - p['y']) <= d['r'] + p['r'] + 2:
                     if d['type'] == 'wood':
                         p['wood'] += d['amount']
@@ -690,40 +725,49 @@ class Game:
                     elif d['type'] == 'key':
                         self.has_ruin_key = True
                         self.message = 'Chave da ruína obtida'
-                    self.drops.remove(d)
+                else:
+                    drops_to_keep.append(d)
+            self.drops = drops_to_keep
             # Traps damage
             for s in self.structures:
                 if s['type'] == 'trap' and not s['broken']:
                     s['tick'] = s.get('tick', 0) - dt
-                    for e in self.enemies[:]:
-                        if circle_rect_collision(e['x'], e['y'], e['r'], s['x'], s['y'], s['w'], s['h']):
-                            if s['tick'] <= 0:
+                    if s['tick'] <= 0:
+                        for e in self.enemies[:]:
+                            if circle_rect_collision(e['x'], e['y'], e['r'], s['x'], s['y'], s['w'], s['h']):
                                 e['hp'] -= 8 if s['level'] == 1 else 14
                                 s['tick'] = 0.35
                                 if e['hp'] <= 0:
                                     self.kill_enemy(e)
-                                    break
+                                break
             # Enemies
+            enemy_solids = self.get_enemy_solids()  # Cache solids once
+            px, py = p['x'], p['y']  # Cache player position
+            camp_rect = self.cabin_rect()  # Cache camp rect
+
             for e in self.enemies[:]:
                 e['hitFlash'] = max(0.0, e['hitFlash'] - dt)
                 e['attackCd'] = max(0.0, e['attackCd'] - dt)
                 e['shootCd'] = max(0.0, e['shootCd'] - dt)
                 e['laserCd'] = max(0.0, e['laserCd'] - dt)
                 # Pursue player
-                ang = math.atan2(p['y'] - e['y'], p['x'] - e['x'])
-                vx = math.cos(ang) * e['speed']
-                vy = math.sin(ang) * e['speed']
-                # Move enemy
-                e['x'] += vx * dt
-                e['y'] += vy * dt
+                dx = px - e['x']
+                dy = py - e['y']
+                dist = math.hypot(dx, dy)
+                if dist > 0:
+                    vx = (dx / dist) * e['speed']
+                    vy = (dy / dist) * e['speed']
+                    # Move enemy
+                    e['x'] += vx * dt
+                    e['y'] += vy * dt
                 # Clamp to play area
                 e['x'] = clamp(e['x'], -40, WIDTH + 40)
                 e['y'] = clamp(e['y'], -40, HEIGHT + 40)
                 # Resolve collisions against camp, ruin and walls
-                for rect in self.get_enemy_solids():
+                for rect in enemy_solids:
                     resolve_circle_rect(e, rect)
                 # Enemy shooting
-                if e['shootCd'] <= 0 and math.hypot(e['x'] - p['x'], e['y'] - p['y']) < 460:
+                if e['shootCd'] <= 0 and dist < 460:
                     self.enemy_shoot(e)
                     e['shootCd'] = 1.35 if e['finalBoss'] else 1.85
                 # Boss laser
@@ -731,12 +775,12 @@ class Game:
                     self.spawn_laser(e)
                     e['laserCd'] = 3.2
                 # Damage player if overlapping
-                if math.hypot(e['x'] - p['x'], e['y'] - p['y']) < e['r'] + p['r'] + 2 and e['attackCd'] <= 0:
+                ex, ey, er = e['x'], e['y'], e['r']
+                if dist < er + p['r'] + 2 and e['attackCd'] <= 0:
                     self.damage_player(e['damage'])
                     e['attackCd'] = 0.7
                 # Damage camp on collision
-                camp_rect = self.cabin_rect()
-                if circle_rect_collision(e['x'], e['y'], e['r'], camp_rect['x'], camp_rect['y'], camp_rect['w'], camp_rect['h']) and e['attackCd'] <= 0:
+                if circle_rect_collision(ex, ey, er, camp_rect['x'], camp_rect['y'], camp_rect['w'], camp_rect['h']) and e['attackCd'] <= 0:
                     self.damage_camp(e['damage'])
                     e['attackCd'] = 0.8
                 # Damage walls or traps when enemies collide with them.  Walls and traps
@@ -744,7 +788,7 @@ class Game:
                 # damaging one structure to avoid double hits in the same frame.
                 for s in self.structures:
                     if (not s['broken'] and
-                            circle_rect_collision(e['x'], e['y'], e['r'], s['x'], s['y'], s['w'], s['h']) and
+                            circle_rect_collision(ex, ey, er, s['x'], s['y'], s['w'], s['h']) and
                             e['attackCd'] <= 0):
                         # Damage structure regardless of type; walls and traps take
                         # the same amount of damage from enemies.  After breaking,
@@ -753,7 +797,8 @@ class Game:
                         e['attackCd'] = 0.7
                         break
             # Lasers telegraphs update
-            for t in self.telegraphs[:]:
+            telegraphs_to_keep = []
+            for t in self.telegraphs:
                 if t['timer'] > 0:
                     t['timer'] -= dt
                 else:
@@ -762,13 +807,17 @@ class Game:
                         if line_point_distance(p['x'], p['y'], t['x1'], t['y1'], t['x2'], t['y2']) <= p['r'] + 7:
                             self.damage_player(t['damage'])
                         t['dealt'] = True
-                    if t['activeTimer'] <= 0:
-                        self.telegraphs.remove(t)
+                    if t['activeTimer'] > 0:
+                        telegraphs_to_keep.append(t)
+            self.telegraphs = telegraphs_to_keep
+
             # Effects fade
-            for fx in self.effects[:]:
+            effects_to_keep = []
+            for fx in self.effects:
                 fx['life'] -= dt
-                if fx['life'] <= 0:
-                    self.effects.remove(fx)
+                if fx['life'] > 0:
+                    effects_to_keep.append(fx)
+            self.effects = effects_to_keep
             # Check if wave ends
             self.end_wave_if_clear()
 
@@ -990,24 +1039,28 @@ class Game:
         for b in self.bullets:
             pygame.draw.circle(self.screen, (255, 209, 102), (int(b['x']), int(b['y'])), int(b['r']))
         for b in self.enemy_bullets:
-            pygame.draw.circle(self.screen, b.get('color', (214, 40, 40)), (int(b['x']), int(b['y'])), int(b['r']))
+            color = b.get('color', (214, 40, 40))
+            pygame.draw.circle(self.screen, color, (int(b['x']), int(b['y'])), int(b['r']))
         # Lasers telegraphs
-        for t in self.telegraphs:
-            # Warning: semi‑transparent line when timer>0, opaque when active
-            if t['timer'] > 0:
-                alpha = int(255 * (1 - t['timer'] / 0.6))
-                color = (255, 87, 51, alpha)
-            else:
-                color = (255, 87, 51, 255)
-            surf = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-            pygame.draw.line(surf, color, (t['x1'], t['y1']), (t['x2'], t['y2']), 4)
-            self.screen.blit(surf, (0, 0))
+        if self.telegraphs:
+            self._effect_surface.fill((0, 0, 0, 0))  # Clear surface
+            for t in self.telegraphs:
+                # Warning: semi‑transparent line when timer>0, opaque when active
+                if t['timer'] > 0:
+                    alpha = int(255 * (1 - t['timer'] / 0.6))
+                    color = (255, 87, 51, alpha)
+                else:
+                    color = (255, 87, 51, 255)
+                pygame.draw.line(self._effect_surface, color, (t['x1'], t['y1']), (t['x2'], t['y2']), 4)
+            self.screen.blit(self._effect_surface, (0, 0))
+
         # Effects
-        for fx in self.effects:
-            alpha = int(255 * clamp(fx['life'] / 0.5, 0.0, 1.0))
-            surf = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-            pygame.draw.circle(surf, (*fx['color'], alpha), (int(fx['x']), int(fx['y'])), int(fx['r']))
-            self.screen.blit(surf, (0, 0))
+        if self.effects:
+            self._effect_surface.fill((0, 0, 0, 0))  # Clear surface
+            for fx in self.effects:
+                alpha = int(255 * clamp(fx['life'] / 0.5, 0.0, 1.0))
+                pygame.draw.circle(self._effect_surface, (*fx['color'], alpha), (int(fx['x']), int(fx['y'])), int(fx['r']))
+            self.screen.blit(self._effect_surface, (0, 0))
         # Enemies
         for e in self.enemies:
             color = e['color']
@@ -1040,8 +1093,10 @@ class Game:
             else:
                 w, h = (34, 34)
                 base_color = (193, 18, 31)
-            px = mx - w / 2
-            py = my - h / 2
+            half_w = w / 2
+            half_h = h / 2
+            px = mx - half_w
+            py = my - half_h
             preview_rect = {'x': px, 'y': py, 'w': w, 'h': h}
             # Check validity: inside screen and not colliding with player solids
             valid = True
@@ -1393,8 +1448,10 @@ class Game:
         else:
             w, h = (34, 34)
         mx, my = pygame.mouse.get_pos()
-        x = mx - w / 2
-        y = my - h / 2
+        half_w = w / 2
+        half_h = h / 2
+        x = mx - half_w
+        y = my - half_h
         new_rect = {'x': x, 'y': y, 'w': w, 'h': h}
         # Check collision with solids and screen bounds
         if (x < 0 or y < 0 or x + w > WIDTH or y + h > HEIGHT):
@@ -1412,6 +1469,7 @@ class Game:
                 'type': 'wall', 'x': x, 'y': y, 'w': w, 'h': h,
                 'level': 1, 'hp': 100, 'maxHp': 100, 'broken': False
             })
+            self.invalidate_solids_cache()
         else:
             cost_wood = 4
             if self.player['wood'] < cost_wood:
