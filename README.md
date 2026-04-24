@@ -21,7 +21,7 @@ No jogo, o jogador deve posicionar torres estrategicamente para impedir que inim
 🏁 Condição de derrota: Inimigos invadem o acampamento
 🏆 Condição de vitória: Sobreviver às ondas
 
-*🚀 Tecnologias Utilizadas
+🚀 Tecnologias Utilizadas
 💻 Linguagem: Python
 🧠 Paradigma: Programação estruturada / modular
 🛠️ Ferramentas:
@@ -29,7 +29,7 @@ PyCharm
 Visual Studio Code
 📦 Bibliotecas: pygame, random, math, threading, time
 
-*🎮 Controles
+🎮 Controles
 Tecla                              	Ação
 Mouse	                        Posicionar torres
 Tecla E        	             Construir/selecionar
@@ -43,7 +43,7 @@ ESC                            	Pausar/Sair
 ✅ Gerenciamento de recursos
 ✅ Sistema de vitória e derrota
 
-*📈 Melhorias Futuras
+📈 Melhorias Futuras
 Diferentes inimigos com habilidades únicas
 Interface gráfica aprimorada
 Sons e efeitos visuais
