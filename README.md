@@ -53,6 +53,7 @@ Sistema de ranking
 Alison Anthony Galvan
 Gustavo Maxuel de Moura
 Igor Felipe Moretto
+Michel Liberali
 
 📚 Aprendizados
 Este projeto contribuiu para o desenvolvimento de habilidades como:
